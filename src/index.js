@@ -1,10 +1,10 @@
 import 'dotenv/config';
-import Database from 'better-sqlite3';
 import {
   Client,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   Partials,
   PermissionFlagsBits,
 } from 'discord.js';
@@ -23,87 +23,115 @@ const REQUIRED_ENV = [
 
 for (const key of REQUIRED_ENV) {
   if (!process.env[key] || (key === 'BOT_TOKEN' && process.env[key] === 'PEGA_AQUI_TU_TOKEN')) {
-    console.error(`❌ Falta ${key} en el archivo .env`);
+    console.error(`❌ Falta ${key} en las variables de entorno.`);
     process.exit(1);
   }
 }
 
-const dataDir = path.resolve('data');
+// Railway expone RAILWAY_VOLUME_MOUNT_PATH cuando hay un volumen conectado.
+// En local, usamos ./data.
+const dataDir = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : process.env.RAILWAY_VOLUME_MOUNT_PATH || path.resolve('data');
+
 fs.mkdirSync(dataDir, { recursive: true });
-const db = new Database(path.join(dataDir, 'concilio.db'));
-db.pragma('journal_mode = WAL');
+const storePath = path.join(dataDir, 'concilio.json');
+const tempStorePath = `${storePath}.tmp`;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sentences (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    record_code TEXT UNIQUE,
-    ticket_number TEXT NOT NULL,
-    ticket_channel_id TEXT NOT NULL UNIQUE,
-    source_guild_id TEXT NOT NULL,
-    sentenced_user_id TEXT NOT NULL,
-    sentenced_user_tag TEXT NOT NULL,
-    attended_user_id TEXT NOT NULL,
-    attended_user_tag TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    sanction TEXT NOT NULL,
-    server TEXT NOT NULL,
-    registered_by_id TEXT NOT NULL,
-    registered_by_tag TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    transcript_url TEXT,
-    ticket_log_message_id TEXT,
-    wanted_message_id TEXT,
-    created_at TEXT NOT NULL,
-    published_at TEXT
-  );
+function emptyStore() {
+  return {
+    version: 1,
+    nextSentenceId: 1,
+    nextAuditId: 1,
+    sentences: [],
+    audit_log: [],
+  };
+}
 
-  CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sentence_id INTEGER,
-    action TEXT NOT NULL,
-    actor_id TEXT,
-    details TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(sentence_id) REFERENCES sentences(id)
-  );
+function loadStore() {
+  if (!fs.existsSync(storePath)) {
+    const initial = emptyStore();
+    writeStore(initial);
+    return initial;
+  }
 
-  CREATE INDEX IF NOT EXISTS idx_sentences_ticket_number
-  ON sentences(ticket_number);
+  try {
+    const raw = fs.readFileSync(storePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return {
+      ...emptyStore(),
+      ...parsed,
+      sentences: Array.isArray(parsed.sentences) ? parsed.sentences : [],
+      audit_log: Array.isArray(parsed.audit_log) ? parsed.audit_log : [],
+    };
+  } catch (error) {
+    console.error(`❌ No pude leer ${storePath}:`, error);
+    process.exit(1);
+  }
+}
 
-  CREATE INDEX IF NOT EXISTS idx_sentences_wanted_message_id
-  ON sentences(wanted_message_id);
-`);
+function writeStore(nextStore) {
+  const json = JSON.stringify(nextStore, null, 2);
+  fs.writeFileSync(tempStorePath, json, 'utf8');
+  fs.renameSync(tempStorePath, storePath);
+}
 
-const insertSentence = db.prepare(`
-  INSERT INTO sentences (
-    record_code, ticket_number, ticket_channel_id, source_guild_id,
-    sentenced_user_id, sentenced_user_tag,
-    attended_user_id, attended_user_tag,
-    reason, sanction, server,
-    registered_by_id, registered_by_tag,
-    status, created_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-`);
+let store = loadStore();
 
-const getByTicketChannel = db.prepare(
-  'SELECT * FROM sentences WHERE ticket_channel_id = ?',
-);
-const getPending = db.prepare(
-  "SELECT * FROM sentences WHERE status = 'pending' ORDER BY id DESC LIMIT 500",
-);
-const getByWantedMessage = db.prepare(
-  'SELECT * FROM sentences WHERE wanted_message_id = ?',
-);
-const markPublished = db.prepare(`
-  UPDATE sentences
-  SET status = 'published', transcript_url = ?, ticket_log_message_id = ?,
-      wanted_message_id = ?, published_at = ?
-  WHERE id = ?
-`);
-const insertAudit = db.prepare(`
-  INSERT INTO audit_log (sentence_id, action, actor_id, details, created_at)
-  VALUES (?, ?, ?, ?, ?)
-`);
+function persist() {
+  writeStore(store);
+}
+
+function insertSentence(data) {
+  if (store.sentences.some((row) => row.ticket_channel_id === data.ticket_channel_id)) {
+    const err = new Error('Este canal ya tiene una sentencia registrada.');
+    err.code = 'DUPLICATE_TICKET_CHANNEL';
+    throw err;
+  }
+
+  const id = store.nextSentenceId++;
+  const row = { id, ...data };
+  store.sentences.push(row);
+  persist();
+  return row;
+}
+
+function getByTicketChannel(channelId) {
+  return store.sentences.find((row) => row.ticket_channel_id === channelId) || null;
+}
+
+function getPending() {
+  return store.sentences
+    .filter((row) => row.status === 'pending')
+    .sort((a, b) => b.id - a.id)
+    .slice(0, 500);
+}
+
+function getByWantedMessage(messageId) {
+  return store.sentences.find((row) => row.wanted_message_id === messageId) || null;
+}
+
+function updateSentence(id, patch) {
+  const index = store.sentences.findIndex((row) => row.id === id);
+  if (index < 0) throw new Error(`Sentencia ${id} no encontrada.`);
+  store.sentences[index] = { ...store.sentences[index], ...patch };
+  persist();
+  return store.sentences[index];
+}
+
+function insertAudit(sentenceId, action, actorId, details, createdAt) {
+  const row = {
+    id: store.nextAuditId++,
+    sentence_id: sentenceId ?? null,
+    action,
+    actor_id: actorId ?? null,
+    details,
+    created_at: createdAt,
+  };
+  store.audit_log.push(row);
+  persist();
+  return row;
+}
 
 const client = new Client({
   intents: [
@@ -188,13 +216,9 @@ function pickTranscriptUrl(message, searchableText) {
   const urls = extractUrls(message);
   if (!urls.length) return null;
 
-  // Prioriza URLs que parecen transcript/ticket.
-  const preferred = urls.find((url) =>
-    /transcript|ticket|logs?|html/i.test(url),
-  );
+  const preferred = urls.find((url) => /transcript|ticket|logs?|html/i.test(url));
   if (preferred) return preferred;
 
-  // Si el mensaje indica claramente transcript/cierre, acepta la primera URL.
   if (/transcript|closed|close|cerrad[oa]|ticket/i.test(searchableText)) {
     return urls[0];
   }
@@ -245,15 +269,15 @@ async function publishSentence(row, transcriptUrl, ticketLogMessageId) {
   const wantedMessage = await wantedChannel.send({ embeds: [embed] });
   const publishedAt = nowIso();
 
-  markPublished.run(
-    transcriptUrl,
-    ticketLogMessageId,
-    wantedMessage.id,
-    publishedAt,
-    row.id,
-  );
+  updateSentence(row.id, {
+    status: 'published',
+    transcript_url: transcriptUrl,
+    ticket_log_message_id: ticketLogMessageId,
+    wanted_message_id: wantedMessage.id,
+    published_at: publishedAt,
+  });
 
-  insertAudit.run(
+  insertAudit(
     row.id,
     'PUBLISHED',
     client.user.id,
@@ -287,6 +311,7 @@ async function publishSentence(row, transcriptUrl, ticketLogMessageId) {
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`✅ Bot conectado como ${readyClient.user.tag}`);
+  console.log(`✅ Almacenamiento persistente: ${storePath}`);
 
   const checks = [
     ['Servidor de tickets', process.env.TICKETS_GUILD_ID, 'guild'],
@@ -318,18 +343,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  const ephemeral = MessageFlags.Ephemeral;
+
   try {
     if (interaction.guildId !== process.env.TICKETS_GUILD_ID) {
       return interaction.reply({
         content: '❌ Este comando solo funciona en el servidor de tickets.',
-        ephemeral: true,
+        flags: ephemeral,
       });
     }
 
     if (!memberCanSentence(interaction)) {
       return interaction.reply({
         content: '❌ No tienes el rol autorizado para registrar sentencias.',
-        ephemeral: true,
+        flags: ephemeral,
       });
     }
 
@@ -339,17 +366,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         content:
           '❌ No pude detectar el número del ticket en el nombre de este canal. ' +
           'Ejemplo esperado: `ticket-3890` o `reporte-3890`.',
-        ephemeral: true,
+        flags: ephemeral,
       });
     }
 
-    const existing = getByTicketChannel.get(interaction.channelId);
+    const existing = getByTicketChannel(interaction.channelId);
     if (existing) {
       return interaction.reply({
         content:
           `⚠️ Este ticket ya tiene una sentencia registrada: **${existing.record_code}** ` +
           `(${existing.status}). No crearé una segunda automáticamente.`,
-        ephemeral: true,
+        flags: ephemeral,
       });
     }
 
@@ -358,36 +385,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const reason = interaction.options.getString('motivo', true).trim();
     const sanction = interaction.options.getString('sancion', true).trim();
     const server = interaction.options.getString('servidor', true);
-
     const createdAt = nowIso();
 
-    // Primero se crea con un código temporal para obtener el ID.
-    const tempCode = `TEMP-${interaction.channelId}`;
-    const result = insertSentence.run(
-      tempCode,
-      ticketNumber,
-      interaction.channelId,
-      interaction.guildId,
-      sentenced.id,
-      displayTag(sentenced),
-      attended.id,
-      displayTag(attended),
+    const id = store.nextSentenceId;
+    const recordCode = buildRecordCode(ticketNumber, id);
+
+    const row = insertSentence({
+      record_code: recordCode,
+      ticket_number: ticketNumber,
+      ticket_channel_id: interaction.channelId,
+      source_guild_id: interaction.guildId,
+      sentenced_user_id: sentenced.id,
+      sentenced_user_tag: displayTag(sentenced),
+      attended_user_id: attended.id,
+      attended_user_tag: displayTag(attended),
       reason,
       sanction,
       server,
-      interaction.user.id,
-      displayTag(interaction.user),
-      createdAt,
-    );
+      registered_by_id: interaction.user.id,
+      registered_by_tag: displayTag(interaction.user),
+      status: 'pending',
+      transcript_url: null,
+      ticket_log_message_id: null,
+      wanted_message_id: null,
+      created_at: createdAt,
+      published_at: null,
+    });
 
-    const recordCode = buildRecordCode(ticketNumber, result.lastInsertRowid);
-    db.prepare('UPDATE sentences SET record_code = ? WHERE id = ?').run(
-      recordCode,
-      result.lastInsertRowid,
-    );
-
-    insertAudit.run(
-      result.lastInsertRowid,
+    insertAudit(
+      row.id,
       'REGISTERED',
       interaction.user.id,
       JSON.stringify({
@@ -412,7 +438,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `⏱️ Sanción: **${sanction}**\n` +
         `🌐 Servidor: **${server}**\n\n` +
         'Ahora cierra el ticket normalmente con Ticket King. Cuando aparezca el transcript en el canal de logs, lo publicaré automáticamente en WANTED.',
-      ephemeral: true,
+      flags: ephemeral,
     });
 
     await sendAudit(
@@ -433,9 +459,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error('Error en /sentenciar:', error);
     const content = '❌ Ocurrió un error al registrar la sentencia.';
     if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content, ephemeral: true }).catch(() => {});
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
     } else {
-      await interaction.reply({ content, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
     }
   }
 });
@@ -453,11 +479,9 @@ client.on(Events.MessageCreate, async (message) => {
 
     const text = flattenMessage(message);
     if (!text) return;
-
-    // Evita reaccionar a mensajes que claramente no parecen cierres/transcripts.
     if (!/transcript|closed|close|cerrad[oa]|ticket/i.test(text)) return;
 
-    const pending = getPending.all();
+    const pending = getPending();
     const row = pending.find((candidate) => {
       const escaped = candidate.ticket_number.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       return new RegExp(`(^|\\D)${escaped}(\\D|$)`).test(text);
@@ -483,10 +507,10 @@ client.on(Events.MessageDelete, async (message) => {
   try {
     if (message.channelId !== process.env.WANTED_CHANNEL_ID) return;
 
-    const row = getByWantedMessage.get(message.id);
+    const row = getByWantedMessage(message.id);
     if (!row) return;
 
-    insertAudit.run(
+    insertAudit(
       row.id,
       'WANTED_MESSAGE_DELETED',
       null,
@@ -499,7 +523,7 @@ client.on(Events.MessageDelete, async (message) => {
         .setTitle('🚨 ALERTA DE INTEGRIDAD')
         .setDescription(
           `El mensaje de **${row.record_code}** fue eliminado de WANTED.\n` +
-            `La sentencia **permanece guardada en la base de datos**.`,
+            'La sentencia **permanece guardada en la base de datos**.',
         )
         .addFields(
           { name: 'Ticket', value: `#${row.ticket_number}`, inline: true },
@@ -512,6 +536,14 @@ client.on(Events.MessageDelete, async (message) => {
   } catch (error) {
     console.error('Error registrando eliminación de WANTED:', error);
   }
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ uncaughtException:', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ unhandledRejection:', reason);
 });
 
 client.login(process.env.BOT_TOKEN);

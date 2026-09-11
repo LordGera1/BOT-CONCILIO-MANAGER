@@ -1,19 +1,18 @@
 {
   "name": "concilio-wanted-bot",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Bot de sentencias para Concilio RP + Ticket King",
+  "description": "Bot de sentencias para Concilio RP + Ticket King (Railway safe)",
   "main": "src/index.js",
   "scripts": {
     "deploy": "node src/deploy-commands.js",
     "start": "node src/index.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.0.0 <25"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
     "discord.js": "^14.27.0",
     "dotenv": "^17.4.2"
   }
